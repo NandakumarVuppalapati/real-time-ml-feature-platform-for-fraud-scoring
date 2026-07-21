@@ -1,0 +1,234 @@
+name: fraud-feature-platform
+
+x-common-env: &common-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  REDIS_CONNECTION_STRING: redis:6379
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  # Not set here on purpose: every service below mounts feature_repo/ at
+  # ./feature_repo relative to its own WORKDIR (/app), matching each
+  # script's own default `repo_path="feature_repo"` — see model_loader.py
+  # and train.py. feature_repo/definitions.py's FileSource then resolves
+  # "../data/..." against that same mount, so data/ must always be a
+  # sibling of feature_repo/ inside each container, whatever the container
+  # calls its own root.
+  # FEATURE_REPO_PATH: feature_repo
+
+services:
+  # ---------------------------------------------------------------------
+  # Kafka — single-node KRaft mode (no separate ZooKeeper needed), official
+  # Apache image. Event backbone for the raw transaction stream.
+  # ---------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.7.1
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # Redis — Feast's online store. Sub-millisecond feature lookups at
+  # serving time.
+  # ---------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # MLflow — experiment tracking + model registry.
+  # ---------------------------------------------------------------------
+  mlflow:
+    build:
+      context: .
+      dockerfile: mlflow/Dockerfile
+    container_name: mlflow
+    ports:
+      - "5001:5000"
+    volumes:
+      - mlflow-data:/mlflow-data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000')\" || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # Feast — registers feature_repo/definitions.py once at startup, then
+  # exits. Everything else waits on it.
+  # ---------------------------------------------------------------------
+  feast-apply:
+    build:
+      context: .
+      dockerfile: feature_repo/Dockerfile
+    container_name: feast-apply
+    environment:
+      <<: *common-env
+    volumes:
+      - ./feature_repo:/feature_repo
+      - ./data:/data
+
+  # ---------------------------------------------------------------------
+  # Flink — streaming feature computation.
+  # ---------------------------------------------------------------------
+  flink-jobmanager:
+    build:
+      context: .
+      dockerfile: streaming/Dockerfile.flink
+    container_name: flink-jobmanager
+    command: jobmanager
+    ports:
+      - "8081:8081"   # Flink web UI — watch the job, its watermarks, and backpressure here
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  flink-taskmanager:
+    build:
+      context: .
+      dockerfile: streaming/Dockerfile.flink
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+    depends_on:
+      - flink-jobmanager
+    deploy:
+      replicas: 1
+
+  flink-job-submitter:
+    build:
+      context: .
+      dockerfile: streaming/Dockerfile.flink
+    container_name: flink-job-submitter
+    entrypoint: >
+      bash -c "
+        until flink run -m flink-jobmanager:8081 -py /opt/flink/usrlib/flink_feature_job.py -d; do
+          echo 'jobmanager not ready yet, retrying in 5s...'; sleep 5;
+        done"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      flink-jobmanager:
+        condition: service_started
+      flink-taskmanager:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    restart: "no"
+
+  # ---------------------------------------------------------------------
+  # Bridges Flink's output topic into Feast's online store.
+  # ---------------------------------------------------------------------
+  feast-pusher:
+    build:
+      context: .
+      dockerfile: streaming/Dockerfile.pusher
+    container_name: feast-pusher
+    environment:
+      <<: *common-env
+    volumes:
+      - ./feature_repo:/app/feature_repo
+      - ./data:/app/data
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      feast-apply:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------
+  # Replays the (Kaggle) transaction dataset into Kafka as a live stream.
+  # Not started by default (profile "demo") — run explicitly once the rest
+  # of the stack is healthy: `docker compose --profile demo up producer`
+  # ---------------------------------------------------------------------
+  producer:
+    build:
+      context: .
+      dockerfile: ingestion/Dockerfile
+    container_name: producer
+    profiles: ["demo"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    volumes:
+      - ./data:/app/data
+    command: ["--speed", "300"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------
+  # Batch jobs: offline feature computation (Spark) + model training
+  # (MLflow). Not long-running services — invoke on demand:
+  #   docker compose run --rm training python prepare_offline_features.py
+  #   docker compose run --rm training python train.py
+  # ---------------------------------------------------------------------
+  training:
+    build:
+      context: .
+      dockerfile: training/Dockerfile
+    container_name: training
+    profiles: ["tools"]
+    environment:
+      <<: *common-env
+    volumes:
+      - ./data:/app/data
+      - ./feature_repo:/app/feature_repo
+    working_dir: /app
+    # No default command — this service isn't meant to be started with
+    # `docker compose up`. Invoke it on demand, e.g.:
+    #   docker compose run --rm training python prepare_offline_features.py
+    #   docker compose run --rm training python train.py
+    command: ["echo", "Run me with: docker compose run --rm training python <script>.py"]
+
+  # ---------------------------------------------------------------------
+  # FastAPI scoring service.
+  # ---------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: serving/Dockerfile
+    container_name: fraud-api
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *common-env
+    volumes:
+      - ./feature_repo:/app/feature_repo
+      - ./data:/app/data
+    working_dir: /app
+    depends_on:
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+      feast-apply:
+        condition: service_completed_successfully
+
+volumes:
+  mlflow-data:

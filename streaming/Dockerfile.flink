@@ -1,0 +1,33 @@
+# PyFlink image used for the jobmanager, taskmanager, AND the one-shot job
+# submitter service in docker-compose.yml (same image, different command).
+#
+# Pins PyFlink to match the base Flink cluster version exactly — a PyFlink
+# client talking to a mismatched-version cluster is one of the most common
+# "why won't my Flink job start" issues, so this is deliberately not left to
+# floating "latest" tags on either side.
+FROM flink:1.18.1-scala_2.12-java11
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3 python3-pip python3-dev && \
+    ln -s /usr/bin/python3 /usr/bin/python && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir apache-flink==1.18.1
+
+# Kafka SQL connector — not bundled with the base Flink distribution.
+# Coordinate format is <connector-version>-<flink-minor-version> since this
+# connector was externalized from Flink core.
+RUN curl -fSL -o /opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar \
+    https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.1.0-1.18/flink-sql-connector-kafka-3.1.0-1.18.jar
+
+# The JSON format connector ships in Flink's opt/ directory, not lib/, and
+# isn't loaded by default — move it in.
+RUN cp /opt/flink/opt/flink-json-*.jar /opt/flink/lib/ 2>/dev/null || true
+
+WORKDIR /opt/flink/usrlib
+COPY streaming/flink_feature_job.py .
+
+# jobmanager/taskmanager entrypoint is inherited from the base image and
+# controlled by docker-compose's `command:`. The job-submitter service
+# overrides the entrypoint to run `flink run -py ...` against the jobmanager
+# once it's healthy.

@@ -1,0 +1,41 @@
+## Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+## Data (large / private — not committed)
+data/raw/*
+!data/raw/.gitkeep
+data/offline/*
+!data/offline/.gitkeep
+*.parquet
+*.csv
+!data/sample/sample_creditcard.csv
+
+## Feast
+feature_repo/data/*.db*
+feature_repo/.feast/
+
+## MLflow
+mlruns/
+mlflow.db*
+mlartifacts/
+
+## Spark
+spark-warehouse/
+metastore_db/
+derby.log
+
+## Docker / env
+.env
+*.log
+
+## OS / editor
+.DS_Store
+.idea/
+.vscode/

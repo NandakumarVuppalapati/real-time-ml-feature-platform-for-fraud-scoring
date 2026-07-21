@@ -1,0 +1,30 @@
+# Feast feature store configuration.
+#
+# This config targets the docker-compose stack (see docker-compose.yml at repo
+# root): Redis for the online store (sub-millisecond feature lookups at
+# serving time) and local Parquet files for the offline store (produced by
+# training/prepare_offline_features.py, standing in for a warehouse /
+# Databricks table).
+#
+# For a cloud deployment, swap:
+#   - online_store -> AWS ElastiCache (Redis-compatible) or DynamoDB
+#   - offline_store -> S3 + Athena, or Databricks/Delta directly (Feast has a
+#     first-class Databricks/Spark offline store connector)
+#   - registry -> S3-backed registry for multi-writer safety
+# without changing any feature definitions in definitions.py.
+
+project: fraud_feature_platform
+provider: local
+registry: data/registry.db
+
+online_store:
+  type: redis
+  connection_string: "${REDIS_CONNECTION_STRING}"
+
+offline_store:
+  type: file
+
+entity_key_serialization_version: 3
+
+auth:
+  type: no_auth

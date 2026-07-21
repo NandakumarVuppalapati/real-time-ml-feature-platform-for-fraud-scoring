@@ -1,0 +1,17 @@
+# Lightweight image for feast_pusher.py — a plain Kafka consumer + Feast
+# Python SDK client. Deliberately separate from Dockerfile.flink (which is
+# ~1.5GB with the JVM + PyFlink) since this needs neither Java nor PyFlink.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY streaming/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY streaming/feast_pusher.py .
+
+# feature_repo/ (registry.db, feature_store.yaml, offline parquet) is
+# bind-mounted at runtime, not baked in — it must be the *same* directory
+# every other service sees (serving API, training), not a per-image copy
+# that immediately goes stale.
+CMD ["python", "feast_pusher.py"]
