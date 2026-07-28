@@ -120,6 +120,24 @@ services:
     deploy:
       replicas: 1
 
+  # ---------------------------------------------------------------------
+  # Creates the Kafka topics up front. Flink's KafkaSource enumerator (used
+  # by flink_feature_job.py) issues a metadata request that does NOT
+  # trigger broker-side auto-create the way a plain producer does, so
+  # without this, the Flink job fails with UnknownTopicOrPartitionException
+  # on a totally fresh stack (no topic has ever been produced to yet).
+  # ---------------------------------------------------------------------
+  kafka-init:
+    image: apache/kafka:3.7.1
+    container_name: kafka-init
+    entrypoint: >
+      bash -c "
+        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --topic transactions.raw --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1 &&
+        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --topic card_features --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
   flink-job-submitter:
     build:
       context: .
@@ -139,6 +157,8 @@ services:
         condition: service_started
       kafka:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     restart: "no"
 
   # ---------------------------------------------------------------------

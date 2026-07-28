@@ -3,5 +3,6 @@
 # pinned to the cluster's Flink version plus the Kafka SQL connector jar —
 # a plain pip requirements file can't express that jar dependency.
 feast==0.65.0
+redis>=5.0,<6.0
 kafka-python>=2.0,<3.0
 pandas>=2.0,<3.0

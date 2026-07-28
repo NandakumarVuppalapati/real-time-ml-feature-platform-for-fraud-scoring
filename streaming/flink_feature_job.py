@@ -82,8 +82,13 @@ CREATE TABLE card_features (
     txn_amount_avg_1h           DOUBLE,
     time_since_last_txn_sec     DOUBLE,
     distinct_merchant_count_1h  BIGINT,
-    last_merchant_category      STRING,
-    PRIMARY KEY (card_id) NOT ENFORCED
+    last_merchant_category      STRING
+    -- No PRIMARY KEY: each row is a new feature snapshot appended to the
+    -- topic, not an upsert. The plain 'kafka' connector doesn't support a
+    -- PRIMARY KEY constraint (that requires 'upsert-kafka' plus a
+    -- compacted topic) -- and we don't want upsert semantics here anyway,
+    -- since streaming/feast_pusher.py wants every snapshot, not just the
+    -- latest one per card_id.
 ) WITH (
     'connector' = 'kafka',
     'topic' = '{SINK_TOPIC}',
@@ -92,50 +97,100 @@ CREATE TABLE card_features (
 )
 """
 
-# NOTE: COUNT(DISTINCT ...) and LAG-style "previous value" aren't directly
-# expressible in a single OVER clause the way COUNT/SUM/AVG are, so
-# distinct-merchant-count and time-since-last-txn are computed via a second
-# pass over an unbounded-preceding ROWS window using LISTAGG-then-count and
-# LAG, which Flink SQL supports on OVER windows.
+# NOTE: Flink's streaming OVER-aggregate operator only supports a single
+# window per query -- every aggregate in one SELECT must share the same
+# PARTITION BY / ORDER BY / frame bounds ("Over Agg: Unsupported use of OVER
+# windows. All aggregates must be computed on the same window" is Flink's
+# actual validation error if you mix them, which is a real streaming-mode
+# restriction, not a batch-mode one). w1m/w5m/w1h/w_order are four different
+# window bounds, so each gets computed in its own view below, and the
+# results are joined back together on (card_id, event_time) -- which is
+# safe here because every view is derived from the exact same source rows,
+# so the join keys match 1:1 and produce exactly one output row per input
+# transaction.
+VIEW_1M_DDL = """
+CREATE TEMPORARY VIEW w1m_features AS
+SELECT card_id, event_time, COUNT(*) OVER w1m AS txn_count_1m
+FROM transactions
+WINDOW w1m AS (
+    PARTITION BY card_id ORDER BY event_time
+    RANGE BETWEEN INTERVAL '1' MINUTE PRECEDING AND CURRENT ROW
+)
+"""
+
+VIEW_5M_DDL = """
+CREATE TEMPORARY VIEW w5m_features AS
+SELECT card_id, event_time,
+    COUNT(*) OVER w5m AS txn_count_5m,
+    SUM(amount) OVER w5m AS txn_amount_sum_5m
+FROM transactions
+WINDOW w5m AS (
+    PARTITION BY card_id ORDER BY event_time
+    RANGE BETWEEN INTERVAL '5' MINUTE PRECEDING AND CURRENT ROW
+)
+"""
+
+VIEW_1H_DDL = """
+CREATE TEMPORARY VIEW w1h_features AS
+SELECT card_id, event_time,
+    COUNT(*) OVER w1h AS txn_count_1h,
+    AVG(amount) OVER w1h AS txn_amount_avg_1h,
+    COUNT(DISTINCT merchant_category) OVER w1h AS distinct_merchant_count_1h
+FROM transactions
+WINDOW w1h AS (
+    PARTITION BY card_id ORDER BY event_time
+    RANGE BETWEEN INTERVAL '1' HOUR PRECEDING AND CURRENT ROW
+)
+"""
+
+# LAG is a navigation function, not an aggregate -- it uses its own window
+# with the default frame (no explicit ROW/RANGE, which Calcite rejects on
+# LAG/LEAD the same way it rejects one on RANK/ROW_NUMBER).
+VIEW_LAG_DDL = """
+CREATE TEMPORARY VIEW lag_features AS
+SELECT card_id, event_time,
+    CAST(TIMESTAMPDIFF(SECOND, LAG(event_time) OVER w_order, event_time) AS DOUBLE)
+        AS time_since_last_txn_sec,
+    LAG(merchant_category) OVER w_order AS last_merchant_category
+FROM transactions
+WINDOW w_order AS (PARTITION BY card_id ORDER BY event_time)
+"""
+
 FEATURE_QUERY = """
 INSERT INTO card_features
 SELECT
-    card_id,
-    event_time AS event_timestamp,
-    COUNT(*) OVER w1m AS txn_count_1m,
-    COUNT(*) OVER w5m AS txn_count_5m,
-    COUNT(*) OVER w1h AS txn_count_1h,
-    SUM(amount) OVER w5m AS txn_amount_sum_5m,
-    AVG(amount) OVER w1h AS txn_amount_avg_1h,
-    CAST(TIMESTAMPDIFF(SECOND, LAG(event_time) OVER w_order, event_time) AS DOUBLE)
-        AS time_since_last_txn_sec,
-    COUNT(DISTINCT merchant_category) OVER w1h AS distinct_merchant_count_1h,
-    LAG(merchant_category) OVER w_order AS last_merchant_category
-FROM transactions
-WINDOW
-    w1m AS (
-        PARTITION BY card_id ORDER BY event_time
-        RANGE BETWEEN INTERVAL '1' MINUTE PRECEDING AND CURRENT ROW
-    ),
-    w5m AS (
-        PARTITION BY card_id ORDER BY event_time
-        RANGE BETWEEN INTERVAL '5' MINUTE PRECEDING AND CURRENT ROW
-    ),
-    w1h AS (
-        PARTITION BY card_id ORDER BY event_time
-        RANGE BETWEEN INTERVAL '1' HOUR PRECEDING AND CURRENT ROW
-    ),
-    w_order AS (
-        PARTITION BY card_id ORDER BY event_time
-        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    )
+    m.card_id,
+    m.event_time AS event_timestamp,
+    m.txn_count_1m,
+    b.txn_count_5m,
+    c.txn_count_1h,
+    b.txn_amount_sum_5m,
+    c.txn_amount_avg_1h,
+    d.time_since_last_txn_sec,
+    c.distinct_merchant_count_1h,
+    d.last_merchant_category
+FROM w1m_features m
+JOIN w5m_features b ON m.card_id = b.card_id AND m.event_time = b.event_time
+JOIN w1h_features c ON m.card_id = c.card_id AND m.event_time = c.event_time
+JOIN lag_features d ON m.card_id = d.card_id AND m.event_time = d.event_time
 """
 
 
 def main() -> None:
     t_env = build_table_env()
+    # Bounds the state these joins keep around for matching rows across the
+    # four views -- without this, join state grows forever since Flink
+    # can't otherwise know a given (card_id, event_time) will never see a
+    # late match. 24h comfortably covers our own watermark lateness and any
+    # backlog during a demo replay.
+    t_env.get_config().set("table.exec.state.ttl", "24 h")
+
     t_env.execute_sql(SOURCE_DDL)
     t_env.execute_sql(SINK_DDL)
+    t_env.execute_sql(VIEW_1M_DDL)
+    t_env.execute_sql(VIEW_5M_DDL)
+    t_env.execute_sql(VIEW_1H_DDL)
+    t_env.execute_sql(VIEW_LAG_DDL)
     result = t_env.execute_sql(FEATURE_QUERY)
     result.wait()  # blocks — this is a long-running streaming job
 
