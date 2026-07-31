@@ -26,8 +26,9 @@ RUN cp /opt/flink/opt/flink-json-*.jar /opt/flink/lib/ 2>/dev/null || true
 
 WORKDIR /opt/flink/usrlib
 COPY streaming/flink_feature_job.py .
+COPY streaming/submit_job.sh /opt/flink/submit_job.sh
+RUN chmod +x /opt/flink/submit_job.sh
 
 # jobmanager/taskmanager entrypoint is inherited from the base image and
 # controlled by docker-compose's `command:`. The job-submitter service
-# overrides the entrypoint to run `flink run -py ...` against the jobmanager
-# once it's healthy.
+# overrides the entrypoint to run /opt/flink/submit_job.sh instead.

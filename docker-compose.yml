@@ -126,14 +126,25 @@ services:
   # trigger broker-side auto-create the way a plain producer does, so
   # without this, the Flink job fails with UnknownTopicOrPartitionException
   # on a totally fresh stack (no topic has ever been produced to yet).
+  #
+  # Single partition, deliberately: Flink's row-time watermark for a
+  # multi-partition source is the minimum across all partitions, so if one
+  # partition sees sparse or zero traffic (very possible at this data
+  # volume with ~120 unique card_id keys hashed across partitions), the
+  # combined watermark never advances and every time-based OVER aggregate
+  # downstream buffers forever without emitting a single row -- a stalled
+  # watermark, not a crash, so it's silent unless you go looking at
+  # per-operator Records Sent in the Flink UI. At demo scale there's no
+  # throughput reason to shard this topic, so one partition removes the
+  # entire bug class.
   # ---------------------------------------------------------------------
   kafka-init:
     image: apache/kafka:3.7.1
     container_name: kafka-init
     entrypoint: >
       bash -c "
-        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --topic transactions.raw --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1 &&
-        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --topic card_features --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1"
+        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --topic transactions.raw --bootstrap-server kafka:9092 --partitions 1 --replication-factor 1 &&
+        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --topic card_features --bootstrap-server kafka:9092 --partitions 1 --replication-factor 1"
     depends_on:
       kafka:
         condition: service_healthy
@@ -143,11 +154,7 @@ services:
       context: .
       dockerfile: streaming/Dockerfile.flink
     container_name: flink-job-submitter
-    entrypoint: >
-      bash -c "
-        until flink run -m flink-jobmanager:8081 -py /opt/flink/usrlib/flink_feature_job.py -d; do
-          echo 'jobmanager not ready yet, retrying in 5s...'; sleep 5;
-        done"
+    entrypoint: ["/opt/flink/submit_job.sh"]
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     depends_on:

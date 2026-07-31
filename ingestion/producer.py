@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -68,7 +69,17 @@ def to_event(row: pd.Series) -> dict:
         "card_id": row["card_id"],
         "merchant_category": row["merchant_category"],
         "amount": float(row["Amount"]),
-        "event_time": event_time.isoformat(),
+        # Flink's JSON format (json.timestamp-format.standard=ISO-8601) only
+        # accepts a literal 'Z' suffix for TIMESTAMP_LTZ columns (e.g.
+        # "2020-03-27T12:13:14.123Z") -- it does NOT accept a numeric UTC
+        # offset. Python's datetime.isoformat() on a UTC-aware datetime
+        # renders "+00:00", not "Z", so Flink silently fails to parse this
+        # field (swallowed by json.ignore-parse-errors=true), leaving
+        # event_time NULL and the WATERMARK permanently stalled -- the same
+        # silent-null failure mode as the earlier TIMESTAMP vs TIMESTAMP_LTZ
+        # bug, one layer deeper. BASE_TIME is always UTC, so this replace is
+        # safe and exact (never a non-UTC offset).
+        "event_time": event_time.isoformat().replace("+00:00", "Z"),
         # V1-V28 are PCA components of the original (never-disclosed) raw
         # features in the Kaggle dataset; we pass them through so a future
         # model iteration could use them directly instead of only the
@@ -122,7 +133,8 @@ def main() -> None:
     parser.add_argument("--input", default=None)
     parser.add_argument("--topic", default="transactions.raw")
     parser.add_argument(
-        "--bootstrap-servers", default="localhost:9092",
+        "--bootstrap-servers",
+        default=os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
         help="Comma-separated Kafka bootstrap servers (docker-compose sets this via env)",
     )
     parser.add_argument("--speed", type=float, default=200.0, help="Playback speed multiplier")
@@ -131,7 +143,6 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.input is None:
-        import os
         raw = "data/raw/creditcard.csv"
         args.input = raw if os.path.exists(raw) else "data/sample/sample_creditcard.csv"
         logger.info("--input not given, using %s", args.input)

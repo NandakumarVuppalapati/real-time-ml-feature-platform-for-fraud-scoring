@@ -1,10 +1,10 @@
 """
-PyFlink Table API / SQL job: the real-time half of the feature platform.
+PyFlink DataStream job: the real-time half of the feature platform.
 
 Consumes the raw transaction stream from Kafka (topic `transactions.raw`,
-written by ingestion/producer.py) and continuously computes trailing-window
-velocity/amount features per card_id, emitting one updated feature row per
-incoming transaction to the Kafka topic `card_features`. A small consumer
+written by ingestion/producer.py) and computes trailing-window velocity/amount
+features per card_id, emitting one updated feature row per incoming
+transaction to the Kafka topic `card_features`. A small consumer
 (streaming/feast_pusher.py) then pushes those rows into Feast's online store
 so serving/main.py can read them with single-digit-millisecond latency.
 
@@ -13,186 +13,165 @@ training/prepare_offline_features.py exactly (same names, same window
 lengths) — that agreement is what prevents training/serving skew. See the
 docstring in feature_repo/definitions.py.
 
-Why SQL OVER windows instead of a DataStream ProcessFunction with manual
-state: Flink SQL's RANGE OVER window (PARTITION BY card_id ORDER BY
-event_time RANGE BETWEEN INTERVAL '5' MINUTE PRECEDING AND CURRENT ROW) is
-exactly "rolling aggregate over the trailing N minutes of this key's
-events" — the same semantics we need, expressed declaratively instead of
-hand-rolled keyed state + timers. It also makes the watermark/lateness
-handling explicit and auditable in one place (the DDL), which matters for
-the "feature freshness guarantees" this project is built around.
+--- Why DataStream + KeyedProcessFunction instead of SQL OVER windows/joins ---
+
+The original implementation used four SQL `OVER` windows (1m/5m/1h counts +
+sums + a LAG-based "time since last txn") joined back together on
+(card_id, event_time), because Flink's streaming OVER-aggregate operator
+only supports one window bound per query. That design hit a real, structural
+bug: the LAG view has no RANGE bound, so it processes and emits almost 1:1
+with its input, while the RANGE-bounded 1m/5m/1h views buffer much more
+internally and fall far behind in wall-clock time — even though every view
+is derived from the exact same source rows. By the time a windowed view's
+row reached the final join, the LAG branch's matching row (which arrived
+almost immediately) had already been evicted from the interval join's state,
+so the final join produced zero output no matter how long the job ran.
+
+This function sidesteps that whole bug class by computing every feature for
+a card in a single pass over that card's own transaction history, with no
+joins and no dependency on Flink's watermark mechanism at all:
+
+- `transactions.raw` is a single partition (see docker-compose.yml's
+  kafka-init comment), and ingestion/producer.py sorts the dataset by `Time`
+  before replaying it — so events for any one card_id arrive to this
+  function already in non-decreasing event-time order. That means a plain
+  per-key list, trimmed against each event's own embedded event_time, gives
+  exactly the same trailing-window semantics the SQL OVER windows were
+  after, without needing watermarks, timers, or a join at all.
+- Every incoming transaction produces exactly one output row, computed
+  directly from that card's state — so there's no cross-stream matching to
+  race or expire.
 
 Run (inside the `flink-taskmanager`/`flink-jobmanager` container, or via
 `flink run -py streaming/flink_feature_job.py` against a running cluster —
-see docker-compose.yml and the streaming/Dockerfile that installs PyFlink +
-the Kafka SQL connector jar):
+see docker-compose.yml and streaming/Dockerfile.flink):
 
     flink run -py streaming/flink_feature_job.py
 """
+import json
 import os
+from datetime import datetime
 
-from pyflink.table import EnvironmentSettings, TableEnvironment
+from pyflink.common import Types
+from pyflink.common.serialization import SimpleStringSchema
+from pyflink.common.watermark_strategy import WatermarkStrategy
+from pyflink.datastream import StreamExecutionEnvironment, KeyedProcessFunction, RuntimeContext
+from pyflink.datastream.connectors.kafka import (
+    KafkaSource,
+    KafkaOffsetsInitializer,
+    KafkaSink,
+    KafkaRecordSerializationSchema,
+)
+from pyflink.datastream.state import ValueStateDescriptor
 
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 SOURCE_TOPIC = os.environ.get("SOURCE_TOPIC", "transactions.raw")
 SINK_TOPIC = os.environ.get("SINK_TOPIC", "card_features")
-# How long a late-arriving event is still accepted into its window before
-# the watermark closes it out. This is *the* freshness/completeness
-# trade-off: raise it and features are more complete but a few hundred ms
-# staler; lower it and features are fresher but a late network retry or
-# clock-skewed producer can get silently dropped from its window.
-MAX_OUT_OF_ORDERNESS = os.environ.get("MAX_OUT_OF_ORDERNESS", "5")  # seconds
+
+ONE_MINUTE_MS = 60_000
+FIVE_MINUTES_MS = 300_000
+ONE_HOUR_MS = 3_600_000
 
 
-def build_table_env() -> TableEnvironment:
-    settings = EnvironmentSettings.in_streaming_mode()
-    t_env = TableEnvironment.create(settings)
-    t_env.get_config().set("pipeline.name", "fraud-card-feature-job")
-    t_env.get_config().set("table.exec.source.idle-timeout", "30 s")
-    return t_env
+def _parse_iso_to_millis(event_time: str) -> int:
+    # ingestion/producer.py emits event_time via
+    # `event_time.isoformat().replace("+00:00", "Z")` — reversing that
+    # substitution round-trips cleanly through datetime.fromisoformat().
+    dt = datetime.fromisoformat(event_time.replace("Z", "+00:00"))
+    return int(dt.timestamp() * 1000)
 
 
-SOURCE_DDL = f"""
-CREATE TABLE transactions (
-    card_id             STRING,
-    merchant_category   STRING,
-    amount              DOUBLE,
-    event_time          TIMESTAMP(3),
-    WATERMARK FOR event_time AS event_time - INTERVAL '{MAX_OUT_OF_ORDERNESS}' SECOND
-) WITH (
-    'connector' = 'kafka',
-    'topic' = '{SOURCE_TOPIC}',
-    'properties.bootstrap.servers' = '{KAFKA_BOOTSTRAP}',
-    'properties.group.id' = 'flink-card-feature-job',
-    'scan.startup.mode' = 'latest-offset',
-    'format' = 'json',
-    'json.timestamp-format.standard' = 'ISO-8601',
-    'json.ignore-parse-errors' = 'true'
-)
-"""
+class CardFeatureFunction(KeyedProcessFunction):
+    """Maintains a trailing 1-hour transaction history per card_id and emits
+    an updated feature snapshot on every new transaction for that card."""
 
-SINK_DDL = f"""
-CREATE TABLE card_features (
-    card_id                     STRING,
-    event_timestamp             TIMESTAMP(3),
-    txn_count_1m                BIGINT,
-    txn_count_5m                BIGINT,
-    txn_count_1h                BIGINT,
-    txn_amount_sum_5m           DOUBLE,
-    txn_amount_avg_1h           DOUBLE,
-    time_since_last_txn_sec     DOUBLE,
-    distinct_merchant_count_1h  BIGINT,
-    last_merchant_category      STRING
-    -- No PRIMARY KEY: each row is a new feature snapshot appended to the
-    -- topic, not an upsert. The plain 'kafka' connector doesn't support a
-    -- PRIMARY KEY constraint (that requires 'upsert-kafka' plus a
-    -- compacted topic) -- and we don't want upsert semantics here anyway,
-    -- since streaming/feast_pusher.py wants every snapshot, not just the
-    -- latest one per card_id.
-) WITH (
-    'connector' = 'kafka',
-    'topic' = '{SINK_TOPIC}',
-    'properties.bootstrap.servers' = '{KAFKA_BOOTSTRAP}',
-    'format' = 'json'
-)
-"""
+    def open(self, runtime_context: RuntimeContext):
+        self.state = runtime_context.get_state(
+            ValueStateDescriptor("txn_history", Types.PICKLED_BYTE_ARRAY())
+        )
 
-# NOTE: Flink's streaming OVER-aggregate operator only supports a single
-# window per query -- every aggregate in one SELECT must share the same
-# PARTITION BY / ORDER BY / frame bounds ("Over Agg: Unsupported use of OVER
-# windows. All aggregates must be computed on the same window" is Flink's
-# actual validation error if you mix them, which is a real streaming-mode
-# restriction, not a batch-mode one). w1m/w5m/w1h/w_order are four different
-# window bounds, so each gets computed in its own view below, and the
-# results are joined back together on (card_id, event_time) -- which is
-# safe here because every view is derived from the exact same source rows,
-# so the join keys match 1:1 and produce exactly one output row per input
-# transaction.
-VIEW_1M_DDL = """
-CREATE TEMPORARY VIEW w1m_features AS
-SELECT card_id, event_time, COUNT(*) OVER w1m AS txn_count_1m
-FROM transactions
-WINDOW w1m AS (
-    PARTITION BY card_id ORDER BY event_time
-    RANGE BETWEEN INTERVAL '1' MINUTE PRECEDING AND CURRENT ROW
-)
-"""
+    def process_element(self, value, ctx):
+        event = json.loads(value)
+        card_id = event["card_id"]
+        event_time_ms = _parse_iso_to_millis(event["event_time"])
+        amount = float(event["amount"])
+        merchant = event["merchant_category"]
 
-VIEW_5M_DDL = """
-CREATE TEMPORARY VIEW w5m_features AS
-SELECT card_id, event_time,
-    COUNT(*) OVER w5m AS txn_count_5m,
-    SUM(amount) OVER w5m AS txn_amount_sum_5m
-FROM transactions
-WINDOW w5m AS (
-    PARTITION BY card_id ORDER BY event_time
-    RANGE BETWEEN INTERVAL '5' MINUTE PRECEDING AND CURRENT ROW
-)
-"""
+        history = self.state.value() or []
+        # (timestamp_ms, amount, merchant_category) tuples, oldest first.
+        history.append((event_time_ms, amount, merchant))
+        history = [h for h in history if h[0] >= event_time_ms - ONE_HOUR_MS]
+        history.sort(key=lambda h: h[0])  # cheap insurance, see module docstring
 
-VIEW_1H_DDL = """
-CREATE TEMPORARY VIEW w1h_features AS
-SELECT card_id, event_time,
-    COUNT(*) OVER w1h AS txn_count_1h,
-    AVG(amount) OVER w1h AS txn_amount_avg_1h,
-    COUNT(DISTINCT merchant_category) OVER w1h AS distinct_merchant_count_1h
-FROM transactions
-WINDOW w1h AS (
-    PARTITION BY card_id ORDER BY event_time
-    RANGE BETWEEN INTERVAL '1' HOUR PRECEDING AND CURRENT ROW
-)
-"""
+        in_1m = [h for h in history if h[0] >= event_time_ms - ONE_MINUTE_MS]
+        in_5m = [h for h in history if h[0] >= event_time_ms - FIVE_MINUTES_MS]
+        in_1h = history
 
-# LAG is a navigation function, not an aggregate -- it uses its own window
-# with the default frame (no explicit ROW/RANGE, which Calcite rejects on
-# LAG/LEAD the same way it rejects one on RANK/ROW_NUMBER).
-VIEW_LAG_DDL = """
-CREATE TEMPORARY VIEW lag_features AS
-SELECT card_id, event_time,
-    CAST(TIMESTAMPDIFF(SECOND, LAG(event_time) OVER w_order, event_time) AS DOUBLE)
-        AS time_since_last_txn_sec,
-    LAG(merchant_category) OVER w_order AS last_merchant_category
-FROM transactions
-WINDOW w_order AS (PARTITION BY card_id ORDER BY event_time)
-"""
+        txn_count_1h = len(in_1h)
+        txn_amount_avg_1h = (sum(h[1] for h in in_1h) / txn_count_1h) if txn_count_1h else 0.0
 
-FEATURE_QUERY = """
-INSERT INTO card_features
-SELECT
-    m.card_id,
-    m.event_time AS event_timestamp,
-    m.txn_count_1m,
-    b.txn_count_5m,
-    c.txn_count_1h,
-    b.txn_amount_sum_5m,
-    c.txn_amount_avg_1h,
-    d.time_since_last_txn_sec,
-    c.distinct_merchant_count_1h,
-    d.last_merchant_category
-FROM w1m_features m
-JOIN w5m_features b ON m.card_id = b.card_id AND m.event_time = b.event_time
-JOIN w1h_features c ON m.card_id = c.card_id AND m.event_time = c.event_time
-JOIN lag_features d ON m.card_id = d.card_id AND m.event_time = d.event_time
-"""
+        if len(history) >= 2:
+            prev_time_ms, _, prev_merchant = history[-2]
+            time_since_last_txn_sec = (event_time_ms - prev_time_ms) / 1000.0
+            last_merchant_category = prev_merchant
+        else:
+            time_since_last_txn_sec = 0.0
+            last_merchant_category = "unknown"
+
+        self.state.update(history)
+
+        out = {
+            "card_id": card_id,
+            "event_timestamp": event["event_time"],
+            "txn_count_1m": len(in_1m),
+            "txn_count_5m": len(in_5m),
+            "txn_count_1h": txn_count_1h,
+            "txn_amount_sum_5m": sum(h[1] for h in in_5m),
+            "txn_amount_avg_1h": txn_amount_avg_1h,
+            "time_since_last_txn_sec": time_since_last_txn_sec,
+            "distinct_merchant_count_1h": len({h[2] for h in in_1h}),
+            "last_merchant_category": last_merchant_category,
+        }
+        yield json.dumps(out)
+
+
+def build_source() -> KafkaSource:
+    return (
+        KafkaSource.builder()
+        .set_bootstrap_servers(KAFKA_BOOTSTRAP)
+        .set_topics(SOURCE_TOPIC)
+        .set_group_id("flink-card-feature-job")
+        .set_starting_offsets(KafkaOffsetsInitializer.latest())
+        .set_value_only_deserializer(SimpleStringSchema())
+        .build()
+    )
+
+
+def build_sink() -> KafkaSink:
+    serializer = (
+        KafkaRecordSerializationSchema.builder()
+        .set_topic(SINK_TOPIC)
+        .set_value_serialization_schema(SimpleStringSchema())
+        .build()
+    )
+    return (
+        KafkaSink.builder()
+        .set_bootstrap_servers(KAFKA_BOOTSTRAP)
+        .set_record_serializer(serializer)
+        .build()
+    )
 
 
 def main() -> None:
-    t_env = build_table_env()
-    # Bounds the state these joins keep around for matching rows across the
-    # four views -- without this, join state grows forever since Flink
-    # can't otherwise know a given (card_id, event_time) will never see a
-    # late match. 24h comfortably covers our own watermark lateness and any
-    # backlog during a demo replay.
-    t_env.get_config().set("table.exec.state.ttl", "24 h")
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
 
-    t_env.execute_sql(SOURCE_DDL)
-    t_env.execute_sql(SINK_DDL)
-    t_env.execute_sql(VIEW_1M_DDL)
-    t_env.execute_sql(VIEW_5M_DDL)
-    t_env.execute_sql(VIEW_1H_DDL)
-    t_env.execute_sql(VIEW_LAG_DDL)
-    result = t_env.execute_sql(FEATURE_QUERY)
-    result.wait()  # blocks — this is a long-running streaming job
+    source = env.from_source(build_source(), WatermarkStrategy.no_watermarks(), "kafka-source")
+    keyed = source.key_by(lambda raw: json.loads(raw)["card_id"], key_type=Types.STRING())
+    features = keyed.process(CardFeatureFunction(), output_type=Types.STRING())
+    features.sink_to(build_sink())
+
+    env.execute("fraud-card-feature-job")
 
 
 if __name__ == "__main__":
