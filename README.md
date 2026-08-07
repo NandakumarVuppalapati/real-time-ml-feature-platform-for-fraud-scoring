@@ -47,7 +47,7 @@ flowchart LR
     subgraph "Batch / training path"
         RAW[(Kaggle creditcard.csv)] --> SP[Spark batch job<br/>prepare_offline_features.py]
         SP -->|same feature defs| PQ[(Parquet<br/>Feast offline store)]
-        PQ --> TR[train.py:<br/>point-in-time join via Feast]
+        PQ --> TR[train.py:<br/>direct parquet read*]
         TR -->|log + register| ML[(MLflow<br/>tracking + registry)]
     end
 
@@ -60,6 +60,10 @@ flowchart LR
     style ML fill:#2980b9,color:#fff
     style PQ fill:#27ae60,color:#fff
 ```
+
+*`train.py` reads the offline parquet directly rather than through Feast's
+`get_historical_features()` — a deliberate, documented change, not a shortcut. See
+[The OOM that almost forced a downsample](#the-oom-that-almost-forced-a-downsample).
 
 ## Stack, and why each piece is here
 
@@ -81,17 +85,67 @@ config and `prepare_offline_features.py`'s Spark master, and the same feature de
 and training/serving code run on managed infrastructure without modification. See
 [Cloud deployment path](#cloud-deployment-path) below.
 
-## A note on the data
+## The dataset
 
-The public [Kaggle "Credit Card Fraud Detection" dataset](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud)
-(mlg-ulb/creditcardfraud) is PCA-anonymized: 28 principal components (`V1`-`V28`), `Time`,
-`Amount`, and a `Class` label — no card or customer identifier. Streaming velocity
-features need something to key on, so `ingestion/producer.py` and
-`data/generate_sample.py` deterministically assign a synthetic `card_id` and
-`merchant_category` to each row. **This is a documented simulation, not a real customer
-graph** — say so plainly if you discuss this project (it's a completely standard
-workaround when demoing streaming features on an anonymized public dataset, and being
-upfront about it is exactly what a hiring manager will want to hear).
+Trained and demoed end-to-end on the full [kartik2112/fraud-detection](https://www.kaggle.com/datasets/kartik2112/fraud-detection)
+dataset — **1,296,675 real-schema transactions** (Sparkov-simulated, but with genuine
+card numbers, merchants, timestamps, geolocation, and cardholder fields, not PCA-anonymized
+components), reflecting the order of magnitude an actual card issuer's fraud team works
+against, not a toy sample. `card_id` is derived directly from each transaction's `cc_num`
+— no synthetic key assignment needed, unlike the small anonymized
+[mlg-ulb/creditcardfraud](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud) dataset
+this project also supports as a zero-setup fallback (`data/sample/sample_creditcard.csv`,
+committed to the repo) for anyone who wants to run it without a Kaggle account.
+`ingestion/enrich.py` detects which schema is on disk and normalizes either into the same
+`card_id` / `merchant_category` / `amount` / `event_time` / `label` shape the rest of the
+pipeline consumes, so nothing downstream needs to know which dataset is in play.
+
+## Results
+
+Trained on the full 1,296,675-row dataset (not a downsampled subset — see
+[below](#the-oom-that-almost-forced-a-downsample) for why that mattered):
+
+| Metric | Value |
+|---|---|
+| AUC-ROC | 0.9749 |
+| AUC-PR | 0.5289 |
+| Recall | 90.0% |
+| Precision | 6.9% |
+| F1 | 0.129 |
+| Training rows | 972,506 (75% split) |
+| Test rows | 324,169 (25% split) |
+
+Precision is intentionally low relative to recall: `scale_pos_weight` is tuned in
+`train.py` to catch 9 out of 10 fraud cases, trading off false positives — the standard
+cost asymmetry in fraud scoring, where a missed fraud is far more expensive than a
+manually-reviewed false alarm.
+
+<table>
+<tr><td><img src="docs/screenshots/flink-job-graph.png" width="400"><br/><sub>Flink job graph, live — 9,000 records streamed through the windowed feature job</sub></td>
+<td><img src="docs/screenshots/mlflow-run-metrics.png" width="400"><br/><sub>MLflow run <code>silent-donkey-396</code> — real metrics, registered as <code>fraud-scorer v3</code></sub></td></tr>
+</table>
+
+<img src="docs/screenshots/api-score-response.png" width="500"><br/>
+<sub>A live <code>/score</code> call, scored in 77.91ms using features pulled from Redis at request time</sub>
+
+## The OOM that almost forced a downsample
+
+Feast's local/file-based point-in-time join (`get_historical_features()`) loads its
+offline source into memory regardless of how small the training entity set is — it
+OOM-killed repeatedly on this dataset's scale, even after reducing the join down to a
+matched ~46,000-row slice on both sides, on a machine with ~7.6GB genuinely available to
+Docker. The tempting fix was downsampling the training set to fit; that would have quietly
+defeated the entire point of using a dataset at production scale.
+
+The actual fix (`training/train.py`): recognize that Feast's asof point-in-time join
+exists to handle the general case where a label's timestamp and its feature snapshot's
+timestamp differ. Here they don't — `prepare_offline_features.py` emits exactly one
+feature row per transaction, computed from that card's trailing history strictly up to and
+including that transaction's own timestamp, so the label and the feature snapshot for a
+row share an identical timestamp by construction. An asof join against an exact match
+degenerates to a direct read. Reading the offline parquet straight into pandas returns the
+identical, point-in-time-correct training set — just without the memory blowup — so
+training runs against the full dataset, not a sample.
 
 ## Repository layout
 
@@ -122,12 +176,13 @@ make up
 #    MLflow UI:  http://localhost:5001
 #    Flink UI:   http://localhost:8081
 
-# 2. (Optional but recommended) Get the real dataset instead of the tiny sample
+# 2. (Optional but recommended) Get the real ~1.3M-row dataset instead of the tiny sample
 #    Needs a free Kaggle account -> Account Settings -> API -> Create New Token
 pip install kaggle
 python data/download_dataset.py
 
-# 3. Compute offline features (Spark) and train + register a model (MLflow)
+# 3. Compute offline features (Spark) and train + register a model (MLflow) --
+#    on the full dataset by default, no sampling
 make offline-features
 make train
 
@@ -137,10 +192,11 @@ curl -X POST http://localhost:8000/admin/reload
 # 5. Start replaying transactions into Kafka -> Flink -> Feast, live
 make demo
 
-# 6. Score a transaction
+# 6. Score a transaction (use a card_id/amount/category actually present in
+#    data/raw/fraudTest.csv if you're running against the real dataset)
 curl -X POST http://localhost:8000/score \
   -H "Content-Type: application/json" \
-  -d '{"card_id": "card_0001", "amount": 249.99, "merchant_category": "mcc_012"}'
+  -d '{"card_id": "card_2291163933867244", "amount": 2.86, "merchant_category": "personal_care"}'
 ```
 
 Without Docker, each piece also runs directly (`pip install -r requirements.txt`, see
@@ -154,7 +210,7 @@ pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-The suite (13 tests) validates the Feast feature definitions (apply, push, online read,
+The suite (14 tests) validates the Feast feature definitions (apply, push, online read,
 point-in-time historical read), the Spark rolling-window feature logic on synthetic data,
 the producer's enrichment/serialization functions, and the FastAPI contract — all without
 Docker, Kafka, or Redis running. CI (`.github/workflows/ci.yml`) runs this suite plus a
