@@ -226,6 +226,19 @@ services:
     volumes:
       - ./data:/app/data
       - ./feature_repo:/app/feature_repo
+      # Same path the mlflow service mounts this volume at. MLflow's
+      # default-artifact-root here is a plain local filesystem path
+      # (/mlflow-data/artifacts), not proxied over HTTP -- the tracking
+      # server's REST API handles run/param/metric/registry metadata fine
+      # for any remote client, but mlflow.xgboost.log_model()'s actual model
+      # *file* write goes through a LocalArtifactRepository that assumes the
+      # caller has that same path on its own filesystem. Without this mount,
+      # training silently "succeeded" (registered a model version, no
+      # error) while the model file itself was written into this
+      # short-lived container's own throwaway filesystem and vanished on
+      # `docker compose run --rm` exit -- surfaced later in serving as
+      # "MlflowException: No such artifact: ''".
+      - mlflow-data:/mlflow-data
     working_dir: /app
     # No default command — this service isn't meant to be started with
     # `docker compose up`. Invoke it on demand, e.g.:
@@ -248,6 +261,11 @@ services:
     volumes:
       - ./feature_repo:/app/feature_repo
       - ./data:/app/data
+      # See the identical mount on the training service for why this is
+      # required: MLflow's local artifact store needs the same filesystem
+      # path available to every container that reads or writes model
+      # artifacts, not just the mlflow container itself.
+      - mlflow-data:/mlflow-data
     working_dir: /app
     depends_on:
       redis:

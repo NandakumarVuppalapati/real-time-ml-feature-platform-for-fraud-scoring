@@ -1,97 +1,67 @@
 """
-Kafka producer: replays the (anonymized, historical) Kaggle transaction
-dataset as a live event stream, to stand in for a real card-network feed.
+Kafka producer: replays a transaction dataset as a live event stream, to
+stand in for a real card-network feed.
 
-The Kaggle "creditcardfraud" dataset has no card/customer identifier, so if
-the input file doesn't already have one (the committed data/sample file
-does; the real data/raw/creditcard.csv you download won't), this producer
-assigns a synthetic card_id and merchant_category deterministically from
-each row's hash — see the module docstring in feature_repo/definitions.py
-for why, and why that's a documented simulation choice rather than
-something to gloss over.
+Column normalization (mapping whichever dataset schema is on disk into a
+common card_id/merchant_category/amount/event_time/label shape) lives in
+ingestion/enrich.py, shared with training/train.py — see that module's
+docstring for why it's split out and what schemas it supports.
 
-Playback pacing: the dataset's `Time` column is seconds elapsed between
-transactions. We replay respecting those gaps, compressed by --speed (e.g.
---speed 200 replays 48h of data in ~15 minutes), so downstream Flink
-windowing sees realistic (if compressed) inter-arrival timing rather than
-an unrealistic flat-out burst.
+Playback pacing: we replay respecting the dataset's real inter-event time
+gaps, compressed by --speed (e.g. --speed 300 replays a day of data in a few
+minutes) and capped per-event by --max-gap-sec, so downstream Flink windowing
+sees realistic (if compressed) inter-arrival timing rather than an
+unrealistic flat-out burst.
 
 Usage:
     python ingestion/producer.py --speed 300
-    python ingestion/producer.py --input data/raw/creditcard.csv --topic transactions.raw
+    python ingestion/producer.py --input data/raw/fraudTest.csv --max-rows 50000
 """
 import argparse
-import hashlib
 import json
 import logging
 import os
 import time
-from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 from kafka import KafkaProducer
 
+try:
+    from ingestion.enrich import enrich  # repo-root context (tests, local run)
+except ImportError:
+    from enrich import enrich  # flattened Docker image (see ingestion/Dockerfile)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ingestion.producer")
 
-BASE_TIME = datetime(2013, 9, 1, tzinfo=timezone.utc)
-N_CARDS = 500
-N_MERCHANTS = 80
-
-
-def _stable_bucket(row_hash: str, n_buckets: int) -> int:
-    return int(row_hash, 16) % n_buckets + 1
-
-
-def enrich(df: pd.DataFrame) -> pd.DataFrame:
-    """Adds card_id / merchant_category if the source file doesn't have them
-    (i.e. the raw Kaggle download, as opposed to our pre-enriched sample)."""
-    if "card_id" in df.columns and "merchant_category" in df.columns:
-        return df
-
-    logger.info("Source has no card_id/merchant_category — synthesizing (see docstring)")
-    v_cols = [c for c in df.columns if c.startswith("V")]
-
-    def row_hash(row) -> str:
-        payload = f"{row['Time']}:" + ":".join(f"{row[c]:.6f}" for c in v_cols[:5])
-        return hashlib.md5(payload.encode()).hexdigest()
-
-    hashes = df.apply(row_hash, axis=1)
-    df = df.copy()
-    df["card_id"] = hashes.apply(lambda h: f"card_{_stable_bucket(h, N_CARDS):04d}")
-    df["merchant_category"] = hashes.apply(lambda h: f"mcc_{_stable_bucket(h[8:], N_MERCHANTS):03d}")
-    return df
-
 
 def to_event(row: pd.Series) -> dict:
-    event_time = BASE_TIME + timedelta(seconds=float(row["Time"]))
-    return {
+    out = {
         "card_id": row["card_id"],
         "merchant_category": row["merchant_category"],
-        "amount": float(row["Amount"]),
+        "amount": float(row["amount"]),
         # Flink's JSON format (json.timestamp-format.standard=ISO-8601) only
         # accepts a literal 'Z' suffix for TIMESTAMP_LTZ columns (e.g.
         # "2020-03-27T12:13:14.123Z") -- it does NOT accept a numeric UTC
-        # offset. Python's datetime.isoformat() on a UTC-aware datetime
+        # offset. pandas'/Python's isoformat() on a UTC-aware timestamp
         # renders "+00:00", not "Z", so Flink silently fails to parse this
         # field (swallowed by json.ignore-parse-errors=true), leaving
-        # event_time NULL and the WATERMARK permanently stalled -- the same
-        # silent-null failure mode as the earlier TIMESTAMP vs TIMESTAMP_LTZ
-        # bug, one layer deeper. BASE_TIME is always UTC, so this replace is
-        # safe and exact (never a non-UTC offset).
-        "event_time": event_time.isoformat().replace("+00:00", "Z"),
-        # V1-V28 are PCA components of the original (never-disclosed) raw
-        # features in the Kaggle dataset; we pass them through so a future
-        # model iteration could use them directly instead of only the
-        # engineered velocity features.
+        # event_time NULL and the WATERMARK permanently stalled. event_time
+        # is always UTC here, so this replace is safe and exact.
+        "event_time": row["event_time"].isoformat().replace("+00:00", "Z"),
+        # V1-V28 (only present for the mlg-ulb-derived schemas) are PCA
+        # components of that dataset's original raw features; passed through
+        # so a model iteration could use them directly. No-op for the real
+        # (kartik2112) dataset, which has no V columns.
         **{c: float(row[c]) for c in row.index if c.startswith("V")},
-        "label": int(row["Class"]) if "Class" in row else None,
+        "label": int(row["label"]) if pd.notna(row.get("label")) else None,
     }
+    return out
 
 
 def run(args: argparse.Namespace) -> None:
     df = pd.read_csv(args.input)
-    df = enrich(df).sort_values("Time").reset_index(drop=True)
+    df = enrich(df).sort_values("event_time").reset_index(drop=True)
     if args.max_rows:
         df = df.head(args.max_rows)
 
@@ -111,11 +81,12 @@ def run(args: argparse.Namespace) -> None:
     sent = 0
     try:
         for _, row in df.iterrows():
+            cur_time = row["event_time"].timestamp()
             if prev_time is not None:
-                gap = max(float(row["Time"]) - prev_time, 0.0) / args.speed
+                gap = max(cur_time - prev_time, 0.0) / args.speed
                 if gap > 0:
                     time.sleep(min(gap, args.max_gap_sec))
-            prev_time = float(row["Time"])
+            prev_time = cur_time
 
             event = to_event(row)
             producer.send(args.topic, key=event["card_id"], value=event)
@@ -139,11 +110,19 @@ def main() -> None:
     )
     parser.add_argument("--speed", type=float, default=200.0, help="Playback speed multiplier")
     parser.add_argument("--max-gap-sec", type=float, default=2.0, help="Cap on sleep between events")
-    parser.add_argument("--max-rows", type=int, default=None)
+    parser.add_argument(
+        "--max-rows", type=int, default=None,
+        help="Cap on rows replayed -- recommended for the full ~556k-row fraudTest.csv "
+             "(e.g. --max-rows 50000) so a demo run finishes in a reasonable time.",
+    )
     args = parser.parse_args()
 
     if args.input is None:
-        raw = "data/raw/creditcard.csv"
+        # fraudTest.csv, not fraudTrain.csv: the live/demo stream should be
+        # transactions the offline-trained model has never seen -- the same
+        # train/serve split a real fraud team would have. fraudTrain.csv is
+        # read directly by training/prepare_offline_features.py instead.
+        raw = "data/raw/fraudTest.csv"
         args.input = raw if os.path.exists(raw) else "data/sample/sample_creditcard.csv"
         logger.info("--input not given, using %s", args.input)
 

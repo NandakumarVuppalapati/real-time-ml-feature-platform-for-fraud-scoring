@@ -1,21 +1,26 @@
 """
-Trains the fraud classifier on point-in-time-correct historical features
-pulled from Feast, and logs the run (params, metrics, model artifact) to
-MLflow, registering it in the MLflow Model Registry so serving/main.py can
-load "models:/fraud-scorer/Production" (or /Staging, /latest) instead of a
-hardcoded path.
+Trains the fraud classifier on point-in-time-correct historical features,
+and logs the run (params, metrics, model artifact) to MLflow, registering it
+in the MLflow Model Registry so serving/main.py can load
+"models:/fraud-scorer@champion" instead of a hardcoded path.
 
-Why go through Feast here instead of just reading the parquet directly: this
-is the step that actually prevents training/serving skew. get_historical_features
-performs a point-in-time join — for every (card_id, event_timestamp) in the
-label set, it pulls the feature values that were true *as of that moment*,
-using the same feature definitions the online store serves at request time.
-Skip this and read the parquet with a plain merge, and it's easy to
-accidentally leak future feature values into training.
+Reads training/prepare_offline_features.py's output parquet directly rather
+than through Feast's `get_historical_features()`. That's a deliberate
+change, not a shortcut -- see load_training_data()'s docstring for why it's
+still point-in-time-correct with zero leakage risk here, and the git history
+for the live debugging trail that motivated it (Feast's local/file-based
+point-in-time join OOM-killed repeatedly on this dataset's ~1.3M-row scale,
+even after reducing the join down to a matched ~46k rows on both sides, on a
+machine with ~7.6GB genuinely available to Docker -- a real algorithmic
+memory-scaling limitation of that join implementation, not just raw data
+volume). Feast still owns the feature *definitions* and still serves these
+exact features online (feature_repo/definitions.py, streaming/feast_pusher.py,
+serving/main.py) -- this only changes how the offline training pull retrieves
+them, and lets training run against the full dataset instead of a sample.
 
 Usage:
     python training/train.py
-    MLFLOW_TRACKING_URI=http://localhost:5001 python training/train.py --input data/raw/creditcard_enriched.csv
+    python training/train.py --offline-parquet data/offline/card_features.parquet
 """
 import argparse
 import os
@@ -23,7 +28,6 @@ import os
 import mlflow
 import mlflow.xgboost
 import pandas as pd
-from feast import FeatureStore
 from mlflow import MlflowClient
 from sklearn.metrics import (
     average_precision_score,
@@ -34,62 +38,66 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 
-FEATURES = [
-    "card_transaction_features:txn_count_1m",
-    "card_transaction_features:txn_count_5m",
-    "card_transaction_features:txn_count_1h",
-    "card_transaction_features:txn_amount_sum_5m",
-    "card_transaction_features:txn_amount_avg_1h",
-    "card_transaction_features:time_since_last_txn_sec",
-    "card_transaction_features:distinct_merchant_count_1h",
+FEATURE_COLUMNS = [
+    "txn_count_1m",
+    "txn_count_5m",
+    "txn_count_1h",
+    "txn_amount_sum_5m",
+    "txn_amount_avg_1h",
+    "time_since_last_txn_sec",
+    "distinct_merchant_count_1h",
 ]
-FEATURE_COLUMNS = [f.split(":")[1] for f in FEATURES]
 MODEL_NAME = "fraud-scorer"
 
 
-def build_entity_df(input_path: str) -> pd.DataFrame:
-    df = pd.read_csv(input_path)
-    base_time = pd.Timestamp("2013-09-01", tz="UTC")
-    df["event_timestamp"] = base_time + pd.to_timedelta(df["Time"], unit="s")
-    return df[["card_id", "event_timestamp", "Amount", "Class"]]
+def load_training_data(offline_parquet_path: str) -> pd.DataFrame:
+    """Loads point-in-time-correct training data straight from the offline
+    parquet, bypassing Feast's get_historical_features().
+
+    Why this is still point-in-time-correct, not a shortcut that risks
+    leakage: Feast's asof point-in-time join exists to correctly handle the
+    *general* case where an entity's label timestamp and its feature
+    snapshot's timestamp differ -- e.g. a chargeback confirmed three days
+    after the transaction it applies to, where you must be careful to pull
+    features as they stood at transaction time, not as they stand now.
+
+    That's not our case. training/prepare_offline_features.py emits exactly
+    one feature row per transaction, computed from that card's trailing
+    history strictly up to and including that transaction's own
+    event_timestamp -- the label for a row and the feature snapshot for that
+    same row share the identical timestamp *by construction*, because
+    they're the same event. An asof join against an exact timestamp match
+    degenerates to precisely this direct read; Feast's general-purpose
+    implementation just computes that same answer far more expensively (see
+    module docstring). Reading the parquet directly returns the identical
+    training set, just without the memory blowup.
+    """
+    return pd.read_parquet(offline_parquet_path)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", default=None)
-    parser.add_argument("--repo-path", default="feature_repo")
+    parser.add_argument("--offline-parquet", default="data/offline/card_features.parquet")
     parser.add_argument("--test-size", type=float, default=0.25)
     args = parser.parse_args()
 
-    input_path = args.input
-    if input_path is None:
-        raw = "data/raw/creditcard_enriched.csv"
-        input_path = raw if os.path.exists(raw) else "data/sample/sample_creditcard.csv"
-        print(f"--input not given, using {input_path}")
-
-    entity_df = build_entity_df(input_path)
-    print(f"Loaded {len(entity_df)} labeled transactions "
-          f"({entity_df['Class'].sum()} fraud, {entity_df['Class'].mean():.3%} rate)")
-
-    store = FeatureStore(repo_path=args.repo_path)
-    training_df = store.get_historical_features(
-        entity_df=entity_df, features=FEATURES
-    ).to_df()
+    training_df = load_training_data(args.offline_parquet)
+    print(f"Loaded {len(training_df)} labeled transactions "
+          f"({training_df['label'].sum()} fraud, {training_df['label'].mean():.3%} rate)")
 
     # Cold-start rows (a card's very first transaction) have no trailing
     # window history yet — fill rather than drop, since "no prior activity"
     # is itself informative for a fraud model, not missing data to discard.
     training_df[FEATURE_COLUMNS] = training_df[FEATURE_COLUMNS].fillna(0)
 
-    # Cast every feature to float64 up front. Feast returns Int64 columns as
-    # pandas nullable/np.int64 and Float32 columns as float32; left mixed,
-    # MLflow's strict schema enforcement at serving time will reject a
-    # request DataFrame whose dtypes don't match bit-for-bit (int32 vs
-    # int64, float32 vs float64). Scoring a rolling count as a float loses
-    # nothing a tree model cares about, and it removes an entire class of
-    # "works in training, 500s in serving" bugs.
+    # Cast every feature to float64 up front. Mixed int32/int64/float32
+    # dtypes are fine for training, but MLflow's strict schema enforcement
+    # at serving time will reject a request DataFrame whose dtypes don't
+    # match bit-for-bit. Scoring a rolling count as a float loses nothing a
+    # tree model cares about, and it removes an entire class of "works in
+    # training, 500s in serving" bugs.
     X = training_df[FEATURE_COLUMNS].astype("float64")
-    y = training_df["Class"]
+    y = training_df["label"].astype(int)
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=args.test_size, random_state=42, stratify=y
@@ -147,7 +155,7 @@ def main() -> None:
 
         model_info = mlflow.xgboost.log_model(
             model,
-            artifact_path="model",
+            name="model",
             registered_model_name=MODEL_NAME,
             input_example=X_train.head(3),
         )

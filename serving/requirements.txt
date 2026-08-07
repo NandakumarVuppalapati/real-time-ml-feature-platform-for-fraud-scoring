@@ -2,6 +2,9 @@ fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30,<1.0
 feast==0.65.0
 mlflow==3.14.0
-xgboost>=2.0,<3.0
+# Matches training/requirements.txt's pin -- see the comment there for why
+# the upper bound was dropped (scikit-learn 1.6+/1.9 compatibility,
+# dmlc/xgboost#11021 wasn't enough on its own).
+xgboost>=2.1.4
 pandas>=2.0,<3.0
 redis>=5.0,<6.0

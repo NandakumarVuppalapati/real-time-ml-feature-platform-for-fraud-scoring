@@ -35,14 +35,40 @@ def test_enrich_is_deterministic():
     assert out1["card_id"].iloc[0] == out2["card_id"].iloc[0]
 
 
+def test_enrich_maps_real_dataset_columns():
+    """kartik2112/fraud-detection schema — real fields, nothing synthesized."""
+    df = pd.DataFrame(
+        {
+            "trans_date_trans_time": ["2019-01-01 00:00:18", "2019-01-01 00:05:00"],
+            "cc_num": [4111111111111111, 4111111111111111],
+            "merchant": ["fraud_Kirlin and Sons", "fraud_Sporer-Keebler"],
+            "category": ["grocery_pos", "shopping_net"],
+            "amt": [4.97, 220.11],
+            "is_fraud": [0, 1],
+        }
+    )
+    out = enrich(df)
+    assert list(out["card_id"]) == ["card_4111111111111111", "card_4111111111111111"]
+    assert list(out["merchant_category"]) == ["grocery_pos", "shopping_net"]
+    assert list(out["amount"]) == [4.97, 220.11]
+    assert list(out["label"]) == [0, 1]
+    assert out["event_time"].dt.tz is not None
+
+
 def test_to_event_shape():
     row = pd.Series(
-        {"Time": 3600.0, "V1": 0.5, "Amount": 99.99, "card_id": "card_0001",
-         "merchant_category": "mcc_007", "Class": 1}
+        {
+            "card_id": "card_0001",
+            "merchant_category": "mcc_007",
+            "amount": 99.99,
+            "event_time": pd.Timestamp("2013-09-01T01:00:00", tz="UTC"),
+            "label": 1,
+            "V1": 0.5,
+        }
     )
     event = to_event(row)
     assert event["card_id"] == "card_0001"
     assert event["amount"] == 99.99
     assert event["label"] == 1
-    assert "event_time" in event
+    assert event["event_time"] == "2013-09-01T01:00:00Z"
     assert event["V1"] == 0.5

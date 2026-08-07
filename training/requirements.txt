@@ -1,7 +1,20 @@
 pyspark==3.5.1
-feast==0.65.0
+# No feast/redis here: train.py reads training/prepare_offline_features.py's
+# output parquet directly instead of through Feast's get_historical_features()
+# -- see train.py's module docstring for why that's still point-in-time
+# correct. Feast itself is still a real part of the architecture (feature
+# definitions + online serving), just not something this container needs.
 mlflow==3.14.0
 scikit-learn>=1.4,<2.0
-xgboost>=2.0,<3.0
+# >=2.1.4 alone still isn't enough: that's XGBoost's last 2.x release, and it
+# only fixed compatibility with scikit-learn 1.6's *initial* tag-system
+# change (dmlc/xgboost#11021). Live testing landed 2.1.4 next to
+# scikit-learn 1.9.0 -- a newer release that apparently moved the tags
+# protocol further -- and hit the exact same "TypeError: _estimator_type
+# undefined" during mlflow.xgboost.log_model(), after training itself
+# completed fine. The real fix is letting pip reach XGBoost's 3.x line,
+# which targets current scikit-learn releases; capping at <3.0 was what
+# forced the resolver back onto the broken 2.1.4 floor.
+xgboost>=2.1.4
 pandas>=2.0,<3.0
 pyarrow>=14.0,<19.0

@@ -6,7 +6,7 @@ WORKDIR /app
 COPY ingestion/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY ingestion/producer.py .
+COPY ingestion/producer.py ingestion/enrich.py .
 
 # data/ is bind-mounted at runtime (see docker-compose.yml) rather than
 # baked into the image — the raw Kaggle CSV is ~150MB and gitignored, and

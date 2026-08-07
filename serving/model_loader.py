@@ -51,6 +51,13 @@ def _load_model():
     # pyfunc wrapper only exposes .predict(), which for a classifier returns
     # hard 0/1 labels — useless for a fraud *score*, and it also enforces a
     # strict input schema that's brittle across pandas dtype variations.
+    #
+    # Note: this alias URI resolves correctly on its own -- the earlier
+    # "MlflowException: No such artifact: ''" wasn't a registry/alias
+    # resolution bug. It was that the artifact *file* had never actually
+    # been written to a shared location in the first place (see
+    # docker-compose.yml's mlflow-data volume mount on the training and api
+    # services for the real root cause).
     model = mlflow.xgboost.load_model(model_uri)
     logger.info("Loaded %s v%s (%s)", MODEL_NAME, model_version.version, model_uri)
     return model, str(model_version.version)
